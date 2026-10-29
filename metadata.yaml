@@ -1,0 +1,127 @@
+name: Inactive Users Cleanup
+description: >-
+  Identifies and deactivates dormant DataRobot users.  Runs the full pipeline:
+  fetch active users, check last activity, identify dormant accounts, split by
+  seat type, scan owned resources, deactivate, and generate an Excel report.
+
+runtimeParameterDefinitions:
+  - fieldName: DRY_RUN
+    type: string
+    defaultValue: "true"
+    description: >-
+      Safety flag.  "true" = log what would happen without deactivating anyone.
+      Set to "false" only when you are ready to deactivate for real.
+
+  - fieldName: DORMANCY_THRESHOLD_DAYS
+    type: string
+    defaultValue: "40"
+    description: >-
+      Number of days of inactivity before a user is considered dormant.
+
+  - fieldName: EXCLUDE_ACCOUNTS
+    type: string
+    allowEmpty: true
+    description: >-
+      Comma-separated emails to exclude from the entire pipeline.
+      These users will never be flagged dormant or deactivated.
+
+  - fieldName: INCLUDE_ONLY_ACCOUNTS
+    type: string
+    allowEmpty: true
+    description: >-
+      Comma-separated emails to process exclusively. When set, only these
+      users flow through the pipeline — all others are ignored. Leave empty
+      to process all users. Useful for testing on a small subset.
+
+  # - fieldName: BUILDER_MODE
+  #   type: string
+  #   defaultValue: resource_inventory
+  #   description: >-
+  #     How to handle dormant Builder-seat users.
+  #     resource_inventory — use pre-scanned inventory; deactivate if 0 resources.
+  #     manual_review — flag all for review, no API calls.
+  #     resource_check — query resources per-user via API.
+  #     force_deactivate — deactivate all regardless of resources.
+
+  # - fieldName: NON_BUILDER_SEAT_TYPES
+  #   type: string
+  #   defaultValue: "Non-Builder,viewer,consumer,read-only"
+  #   description: >-
+  #     Comma-separated seat-type values treated as Non-Builder (case-insensitive).
+  #     Any seat type NOT in this list defaults to Builder.
+
+  # - fieldName: REQUEST_TIMEOUT
+  #   type: string
+  #   defaultValue: "30"
+  #   description: HTTP request timeout in seconds.
+
+  # - fieldName: MAX_RETRIES
+  #   type: string
+  #   defaultValue: "3"
+  #   description: Retry attempts for transient API failures.
+
+  # - fieldName: RETRY_BACKOFF
+  #   type: string
+  #   defaultValue: "2.0"
+  #   description: Exponential backoff base in seconds.
+
+  # - fieldName: REQUEST_DELAY
+  #   type: string
+  #   defaultValue: "0.3"
+  #   description: Delay between API calls to avoid rate-limiting (seconds).
+
+  # - fieldName: SSL_VERIFY
+  #   type: string
+  #   defaultValue: "false"
+  #   description: >-
+  #     Set to "true" to enable SSL certificate verification on API calls.
+
+  - fieldName: SEND_EMAIL
+    type: string
+    defaultValue: "false"
+    description: >-
+      Set to "true" to email the deactivation report to the security team.
+      Email is only sent on live runs (DRY_RUN=false).
+
+  - fieldName: SMTP_HOST
+    type: string
+    defaultValue: smtp.office365.com
+    description: SMTP server hostname.
+
+  - fieldName: SMTP_PORT
+    type: string
+    defaultValue: "587"
+    description: SMTP server port (587 for STARTTLS, 25 for internal relays).
+
+  - fieldName: SMTP_USE_CRED
+    type: string
+    allowEmpty: true
+    description: >-
+      Force authentication on ("true") or off ("false"). Leave empty for auto —
+      auth is used only when SMTP_USER and SMTP_PASSWORD are both provided.
+      STARTTLS follows authentication.
+
+  - fieldName: SMTP_USER
+    type: string
+    allowEmpty: true
+    description: >-
+      SMTP login username (usually the sender email address). Leave empty for
+      an unauthenticated/open relay.
+
+  - fieldName: SMTP_PASSWORD
+    type: credential
+    description: >-
+      SMTP login password (stored securely in DataRobot credential vault).
+      Leave unset for an unauthenticated/open relay.
+
+  - fieldName: EMAIL_FROM
+    type: string
+    allowEmpty: true
+    description: >-
+      From address for the report email. Defaults to SMTP_USER if not set.
+
+  - fieldName: EMAIL_TO
+    type: string
+    allowEmpty: true
+    description: >-
+      Comma-separated recipient email addresses for the deactivation report.
