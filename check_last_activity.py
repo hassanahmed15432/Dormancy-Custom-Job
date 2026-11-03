@@ -2,15 +2,21 @@
 """
 Step 2 — Determine Last Activity Date per User
 ================================================
-For each active user (from Step 1 output), queries two DataRobot API
-endpoints to find the most recent *real* activity timestamp:
+For each active user (from Step 1 output), checks three activity sources
+within the dormancy window, cheapest first, and stops at the first one that
+shows activity (any activity in the window means the user is not dormant):
 
-  1. App Usage           — /api/v2/eventLogs/ (excluding admin events like
+  1. Token Exchange      — /api/v2/eventLogs/?event=External token exchanged
+     (JWT sign-ins, e.g. users of custom apps behind an external IdP).
+     Searched in narrowing windows: last 1 day, then 1–7 days, then the rest.
+  2. App Usage           — /api/v2/eventLogs/ (excluding admin events like
      Activate/Deactivate/Update account)
-  2. Prediction Usage    — /api/v2/eventLogs/predictionUsage/
+  3. Prediction Usage    — /api/v2/eventLogs/predictionUsage/ (scanned in
+     24-hour windows, so it is only queried when 1 and 2 find nothing)
 
-The later of the two timestamps is kept as the user's last activity date.
-The specific event type that triggered the timestamp is also recorded.
+Audit logs are not designed for high request volume, so every query asks
+for the minimum number of records and calls are throttled by REQUEST_DELAY.
+The source and event type that produced the timestamp are recorded.
 
 Usage
 -----
@@ -63,8 +69,15 @@ SSL_VERIFY: bool = os.getenv("SSL_VERIFY", "false").lower() in ("true", "1", "ye
 
 DORMANCY_THRESHOLD_DAYS: int = int(os.getenv("DORMANCY_THRESHOLD_DAYS", "40"))
 
-# Throttle delay between per-user API calls (seconds) to avoid rate-limiting
-REQUEST_DELAY: float = float(os.getenv("REQUEST_DELAY", "0.2"))
+# Throttle delay between audit-log API calls (seconds) to avoid overloading them
+REQUEST_DELAY: float = float(os.getenv("REQUEST_DELAY", "0.5"))
+
+TOKEN_EXCHANGE_EVENT: str = os.getenv("TOKEN_EXCHANGE_EVENT", "External token exchanged")
+
+# Records per app-usage page, and max pages to read when a page holds only
+# excluded admin events
+APP_USAGE_PAGE_SIZE: int = int(os.getenv("APP_USAGE_PAGE_SIZE", "20"))
+APP_USAGE_MAX_PAGES: int = int(os.getenv("APP_USAGE_MAX_PAGES", "3"))
 
 if not SSL_VERIFY:
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -220,6 +233,74 @@ EXCLUDED_EVENT_TYPES: frozenset[str] = frozenset(
 )
 
 
+def _iso_z(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def _token_exchange_windows(
+    cutoff: datetime,
+    now: datetime,
+) -> list[tuple[datetime, datetime]]:
+    """Non-overlapping search windows, newest first: last 1 day, 1–7 days
+    ago, then 7 days ago back to *cutoff*."""
+    windows: list[tuple[datetime, datetime]] = []
+    window_end = now
+    for days in (1, 7):
+        window_start = max(now - timedelta(days=days), cutoff)
+        if window_start >= window_end:
+            break
+        windows.append((window_start, window_end))
+        window_end = window_start
+    if window_end > cutoff:
+        windows.append((cutoff, window_end))
+    return windows
+
+
+def _get_last_token_exchange(
+    session: requests.Session,
+    user_id: str,
+    cutoff: datetime,
+    now: datetime,
+) -> tuple[datetime | None, str | None]:
+    """Query GET /api/v2/eventLogs/ for the user's most recent
+    ``External token exchanged`` event (JWT sign-in).
+
+    A JWT user can produce thousands of these per day, so each query asks
+    for a single record and the most recent window is searched first.
+
+    Returns ``(timestamp, event_type)`` or ``(None, None)``.
+    """
+    for idx, (window_start, window_end) in enumerate(_token_exchange_windows(cutoff, now)):
+        if idx > 0:
+            time.sleep(REQUEST_DELAY)
+
+        url = (
+            f"{DATAROBOT_API_URL}/api/v2/eventLogs/"
+            f"?userId={quote(user_id)}"
+            f"&event={quote(TOKEN_EXCHANGE_EVENT)}"
+            f"&auditReportType=APP_USAGE"
+            f"&minTimestamp={quote(_iso_z(window_start))}"
+            f"&maxTimestamp={quote(_iso_z(window_end))}"
+            f"&order=desc&limit=1"
+        )
+        data = _request_with_retry(session, url)
+        if not data:
+            continue
+
+        events = data.get("data") or data.get("results") or []
+        if events:
+            raw_ts = (
+                events[0].get("timestamp")
+                or events[0].get("createdAt")
+                or events[0].get("eventTimestamp")
+            )
+            parsed = _parse_timestamp(raw_ts)
+            if parsed:
+                return parsed, events[0].get("event") or TOKEN_EXCHANGE_EVENT
+
+    return None, None
+
+
 def _get_last_app_usage(
     session: requests.Session,
     user_id: str,
@@ -229,34 +310,46 @@ def _get_last_app_usage(
     """Query GET /api/v2/eventLogs/ for the user's most recent *app usage*
     event, skipping admin-only events (activate/deactivate/update account).
 
+    Reads up to APP_USAGE_MAX_PAGES pages, only moving to the next page when
+    the current one holds nothing but excluded events.
+
     Returns ``(timestamp, event_type)`` or ``(None, None)``.
     """
-    url = (
-        f"{DATAROBOT_API_URL}/api/v2/eventLogs/"
-        f"?userId={quote(user_id)}"
-        f"&minTimestamp={quote(cutoff_iso)}"
-        f"&maxTimestamp={quote(now_iso)}"
-        f"&order=desc"
-    )
-    data = _request_with_retry(session, url)
-    if not data:
-        return None, None
+    for page in range(APP_USAGE_MAX_PAGES):
+        if page > 0:
+            time.sleep(REQUEST_DELAY)
 
-    events = data.get("data") or data.get("results") or []
-
-    for evt in events:
-        event_name = evt.get("event") or ""
-        if event_name.strip().lower() in EXCLUDED_EVENT_TYPES:
-            continue
-
-        raw_ts = (
-            evt.get("timestamp")
-            or evt.get("createdAt")
-            or evt.get("eventTimestamp")
+        url = (
+            f"{DATAROBOT_API_URL}/api/v2/eventLogs/"
+            f"?userId={quote(user_id)}"
+            f"&minTimestamp={quote(cutoff_iso)}"
+            f"&maxTimestamp={quote(now_iso)}"
+            f"&order=desc"
+            f"&limit={APP_USAGE_PAGE_SIZE}"
+            f"&offset={page * APP_USAGE_PAGE_SIZE}"
         )
-        parsed = _parse_timestamp(raw_ts)
-        if parsed:
-            return parsed, event_name
+        data = _request_with_retry(session, url)
+        if not data:
+            return None, None
+
+        events = data.get("data") or data.get("results") or []
+
+        for evt in events:
+            event_name = evt.get("event") or ""
+            if event_name.strip().lower() in EXCLUDED_EVENT_TYPES:
+                continue
+
+            raw_ts = (
+                evt.get("timestamp")
+                or evt.get("createdAt")
+                or evt.get("eventTimestamp")
+            )
+            parsed = _parse_timestamp(raw_ts)
+            if parsed:
+                return parsed, event_name
+
+        if len(events) < APP_USAGE_PAGE_SIZE or not data.get("next"):
+            break
 
     return None, None
 
@@ -289,7 +382,7 @@ def _get_last_prediction_usage(
             f"?userId={quote(user_id)}"
             f"&minTimestamp={quote(min_ts)}"
             f"&maxTimestamp={quote(max_ts)}"
-            f"&order=desc"
+            f"&order=desc&limit=1"
         )
         data = _request_with_retry(session, url)
 
@@ -307,6 +400,8 @@ def _get_last_prediction_usage(
                     return parsed, event_name
 
         window_end = window_start
+        if window_end > cutoff:
+            time.sleep(REQUEST_DELAY)
 
     return None, None
 
@@ -314,12 +409,18 @@ def _get_last_prediction_usage(
 def check_activity_for_users(
     users: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """For each user, query both event sources and enrich with last_activity.
+    """For each user, check the activity sources in order (token exchange,
+    app usage, prediction usage) and stop at the first that finds activity.
 
     Returns a new list of user dicts with additional fields:
-      - last_event_log:        ISO timestamp or null
+      - last_token_exchange:   ISO timestamp or null
+      - last_app_usage:        ISO timestamp or null
       - last_prediction_usage: ISO timestamp or null
-      - last_activity:         max of the two, ISO timestamp or null
+      - last_activity:         timestamp from the source that found activity
+                               (null when none did)
+      - last_activity_type:    which source / event produced last_activity
+
+    Sources after the first hit are not queried, so their fields stay null.
     """
     _validate_config()
     session = _build_session()
@@ -337,9 +438,7 @@ def check_activity_for_users(
     enriched: list[dict[str, Any]] = []
     total = len(users)
 
-    # Track whether each endpoint is available
-    event_log_available = True
-    pred_usage_available = True
+    found_by_source = {"token_exchange": 0, "app_usage": 0, "prediction_usage": 0}
 
     for idx, user in enumerate(users, start=1):
         user_id = user["user_id"]
@@ -350,37 +449,46 @@ def check_activity_for_users(
             idx, total, email,
         )
 
-        # Source 1: App usage (event log minus admin events)
+        last_token: datetime | None = None
+        token_event_type: str | None = None
         last_app: datetime | None = None
         app_event_type: str | None = None
-        if event_log_available:
-            last_app, app_event_type = _get_last_app_usage(session, user_id, cutoff_iso, now_iso)
-            if last_app is None and idx == 1:
-                logger.info("  appUsage: no events found (or endpoint unavailable)")
-
-        # Source 2: Prediction usage
         last_pred: datetime | None = None
         pred_event_type: str | None = None
-        if pred_usage_available:
+
+        # Source 1: JWT token exchange
+        last_token, token_event_type = _get_last_token_exchange(session, user_id, cutoff, now)
+
+        # Source 2: App usage (event log minus admin events)
+        if last_token is None:
+            time.sleep(REQUEST_DELAY)
+            last_app, app_event_type = _get_last_app_usage(session, user_id, cutoff_iso, now_iso)
+
+        # Source 3: Prediction usage (most expensive — up to one call per day)
+        if last_token is None and last_app is None:
+            time.sleep(REQUEST_DELAY)
             last_pred, pred_event_type = _get_last_prediction_usage(session, user_id, cutoff, now)
-            if last_pred is None and idx == 1:
-                logger.info("  predictionUsage: no events found (or endpoint unavailable)")
 
-        # Take the later of the two
-        last_activity = _later_of(last_app, last_pred)
-
-        # Determine which source provided the last activity
-        if last_activity is None:
-            activity_type = None
-        elif last_app and last_pred and last_app == last_pred:
-            activity_type = f"App Usage ({app_event_type}) + Prediction ({pred_event_type})"
-        elif last_activity == last_app:
+        if last_token is not None:
+            last_activity = last_token
+            activity_type = f"Token Exchange ({token_event_type})"
+            found_by_source["token_exchange"] += 1
+        elif last_app is not None:
+            last_activity = last_app
             activity_type = f"App Usage ({app_event_type})"
-        else:
+            found_by_source["app_usage"] += 1
+        elif last_pred is not None:
+            last_activity = last_pred
             activity_type = f"Prediction Usage ({pred_event_type})"
+            found_by_source["prediction_usage"] += 1
+        else:
+            last_activity = None
+            activity_type = None
 
         enriched_user = {
             **user,
+            "last_token_exchange": _format_iso(last_token),
+            "last_token_event_type": token_event_type,
             "last_app_usage": _format_iso(last_app),
             "last_app_event_type": app_event_type,
             "last_prediction_usage": _format_iso(last_pred),
@@ -394,10 +502,8 @@ def check_activity_for_users(
             last_activity.strftime("%Y-%m-%d %H:%M UTC") if last_activity else "NO ACTIVITY"
         )
         logger.info(
-            "  → last_activity: %s  (app=%s, pred=%s)",
-            activity_str,
-            "✓" if last_app else "—",
-            "✓" if last_pred else "—",
+            "  → last_activity: %s  (%s)",
+            activity_str, activity_type or "no source found activity",
         )
 
         # Throttle to avoid rate-limiting
@@ -412,6 +518,12 @@ def check_activity_for_users(
         "✅  Activity check complete: %d users processed  "
         "(%d with activity, %d without)",
         total, with_activity, without_activity,
+    )
+    logger.info(
+        "   Activity found via: token exchange=%d, app usage=%d, prediction usage=%d",
+        found_by_source["token_exchange"],
+        found_by_source["app_usage"],
+        found_by_source["prediction_usage"],
     )
 
     return enriched
@@ -440,6 +552,8 @@ def _print_summary(users: list[dict[str, Any]], cutoff_days: int) -> None:
         for u in sorted(with_activity, key=lambda x: x["last_activity"], reverse=True):
             dt = u["last_activity"][:16].replace("T", " ")
             src = []
+            if u.get("last_token_exchange"):
+                src.append("token")
             if u["last_app_usage"]:
                 src.append("app")
             if u["last_prediction_usage"]:
@@ -467,6 +581,7 @@ def save_csv(data: list[dict[str, Any]], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = [
         "user_id", "email", "seat_type", "is_active",
+        "last_token_exchange", "last_token_event_type",
         "last_app_usage", "last_app_event_type",
         "last_prediction_usage", "last_pred_event_type",
         "last_activity", "last_activity_type",

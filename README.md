@@ -27,7 +27,7 @@ The pipeline is **safe by default**: `DRY_RUN=true` logs what would happen witho
 ```mermaid
 flowchart TD
     S1["Step 1: Fetch active users<br/>GET /api/v2/users/"] --> S2
-    S2["Step 2: Last activity per user<br/>eventLogs + predictionUsage"] --> S3
+    S2["Step 2: Last activity per user<br/>token exchange → app usage → predictionUsage"] --> S3
     S3["Step 3: Identify dormant accounts<br/>threshold = DORMANCY_THRESHOLD_DAYS"] --> S4
     S4["Step 4: Split by seat type"] --> NB["Non-Builders"]
     S4 --> B["Builders (incl. unknown seat type)"]
@@ -58,12 +58,17 @@ Each step reads the JSON written by the previous step from the `output/` directo
 
 ### Step 2: Determine last activity (`check_last_activity.py`)
 
-For each active user, it checks two sources within the lookback window (the last `DORMANCY_THRESHOLD_DAYS` days):
+For each active user, it checks three sources within the lookback window (the last `DORMANCY_THRESHOLD_DAYS` days). They run in order from cheapest to most expensive, and the step **stops at the first source that finds activity**, because one event in the window is enough to show the user isn't dormant:
 
-1. **App usage:** `GET /api/v2/eventLogs/?userId=…&order=desc`. It takes the newest event that is not an admin action. Admin actions are listed in `EXCLUDED_EVENT_TYPES` (default: `Activate account`, `Deactivate Account`, `Update account`), so an admin touching an account doesn't count as the user being active.
-2. **Prediction usage:** `GET /api/v2/eventLogs/predictionUsage/`. This endpoint only accepts a 24-hour window, so the script scans backwards one day at a time from now to the cutoff and stops at the first event it finds.
+1. **Token exchange (JWT):** `GET /api/v2/eventLogs/?event=External token exchanged&auditReportType=APP_USAGE&order=desc&limit=1`. This covers users who sign in through an external identity provider and use DataRobot with a JWT, for example custom-app users behind Entra ID. A JWT user can generate thousands of these events a day, so each query asks for one record and searches the most recent period first: the last day, then 1–7 days ago, then the rest of the window.
+2. **App usage:** `GET /api/v2/eventLogs/?order=desc&limit=20`. It takes the newest event that is not an admin action. Admin actions are listed in `EXCLUDED_EVENT_TYPES` (default: `Activate account`, `Deactivate Account`, `Update account`), so an admin touching an account doesn't count as the user being active. If a page contains only admin events, it reads up to `APP_USAGE_MAX_PAGES` pages.
+3. **Prediction usage:** `GET /api/v2/eventLogs/predictionUsage/?limit=1`. This endpoint only accepts a 24-hour window, so the script scans backwards one day at a time from now to the cutoff. It's the most expensive source, so it runs only when the first two find nothing.
 
-The later of the two timestamps becomes `last_activity`. The source and event type are recorded in `last_activity_type`. If a user has no activity inside the window, `last_activity` is empty.
+The timestamp from the source that found activity becomes `last_activity`, and the source and event type are recorded in `last_activity_type`, for example `Token Exchange (External token exchanged)`. Sources after the first hit aren't queried, so their columns stay empty. If no source finds activity in the window, `last_activity` is empty.
+
+**Cost per user:** about 1 call for an active JWT user, 4–6 for a user active only in the app, and up to about 44 for a user with no activity (with the default 40-day threshold). Calls are separated by `REQUEST_DELAY`.
+
+> **Audit-log limitations.** Audit logs record critical events only and aren't designed for high request volume. Activity through a **DataRobot API key** produces no specific audit event unless it creates predictions or changes resources. A Non-Builder or service account that only uses an API key will look dormant. Protect these accounts with `EXCLUDE_ACCOUNTS`, or move them to JWT so their token exchanges are tracked.
 
 - **Writes:** `user_activity.json`, `user_activity.csv`
 
@@ -204,11 +209,14 @@ These are commented out in `metadata.yaml`. Uncomment them there to expose them 
 | `BUILDER_MODE` | `resource_inventory` | How dormant Builders are handled (see [Step 5](#step-5-deactivate-dormant-users-deactivate_userspy)). |
 | `NON_BUILDER_SEAT_TYPES` | `Non-Builder,viewer,consumer,read-only` | Seat types treated as Non-Builder. |
 | `EXCLUDED_EVENT_TYPES` | `Activate account,Deactivate Account,Update account` | Event-log events that don't count as user activity. |
+| `TOKEN_EXCHANGE_EVENT` | `External token exchanged` | Audit event that marks a JWT sign-in. |
+| `APP_USAGE_PAGE_SIZE` | `20` | Events per app-usage query. |
+| `APP_USAGE_MAX_PAGES` | `3` | Max app-usage pages read per user when pages contain only admin events. |
 | `PAGE_SIZE` | `100` | Page size for list endpoints. |
 | `REQUEST_TIMEOUT` | `30` | HTTP timeout in seconds. |
 | `MAX_RETRIES` | `3` | Retry attempts for HTTP 5xx errors, connection errors, and timeouts. |
 | `RETRY_BACKOFF` | `2.0` | Exponential backoff base, in seconds. |
-| `REQUEST_DELAY` | `0.2` (`0.3` in Step 5) | Pause between per-user API calls, to avoid rate limiting. |
+| `REQUEST_DELAY` | `0.5` in Step 2, `0.2` in Step R, `0.3` in Step 5 | Pause between API calls, to avoid overloading audit logs and hitting rate limits. |
 | `SSL_VERIFY` | `false` | `true` turns on TLS certificate verification. |
 
 HTTP 429 responses are retried after the server's `Retry-After` delay. HTTP 403/404 responses on read endpoints are treated as "no data" and don't stop the pipeline.
@@ -268,7 +276,7 @@ Everything is written to `output/`, next to the scripts:
 | File | Written by | Contents |
 |---|---|---|
 | `active_users.json/.csv` | Step 1 | Active users after the exclude/include filters |
-| `user_activity.json/.csv` | Step 2 | The above, plus last app usage, last prediction usage, and last activity with its type |
+| `user_activity.json/.csv` | Step 2 | The above, plus last token exchange, last app usage, last prediction usage, and last activity with its type |
 | `dormant_users.json/.csv` | Step 3 | Dormant users with `days_dormant` |
 | `dormant_non_builders.json/.csv` | Step 4 | Non-Builder lane |
 | `dormant_builders.json/.csv` | Step 4 | Builder lane |
@@ -315,6 +323,7 @@ SMTP modes:
 - **Dry run by default.** Nothing is deactivated unless `DRY_RUN=false` is set explicitly.
 - **Unknown means Builder.** A user with a missing or unrecognized seat type goes to the Builder lane, not to auto-deactivation.
 - **Resource owners are protected.** In the default `resource_inventory` mode, a Builder who owns any deployment, project, model, app, job, use case, notebook, or batch prediction is flagged for review instead of deactivated.
+- **JWT users are tracked.** Token exchanges ("External token exchanged") count as activity, so users of custom apps behind an external identity provider aren't deactivated while they're using the apps.
 - **Admin actions don't count as activity.** Activating, deactivating, or updating an account doesn't reset the dormancy clock.
 - **Allow and deny lists.** `EXCLUDE_ACCOUNTS` protects specific accounts; `INCLUDE_ONLY_ACCOUNTS` limits a run to a test group.
 - **Deactivation, not deletion.** Accounts are only deactivated and can be reactivated by an admin. No resources are deleted or transferred.
@@ -328,6 +337,7 @@ SMTP modes:
 |---|---|
 | `DATAROBOT_API_URL is not set` | Running locally without a `.env` file. Set `DATAROBOT_API_URL` and `DATAROBOT_API_TOKEN`. |
 | Many users show "No activity" | The token can't read other users' event logs (HTTP 403 is treated as no data). Use an admin token. |
+| A user of a custom app shows "No activity" | They probably authenticate with an API key, which produces no audit event. Add them to `EXCLUDE_ACCOUNTS` or move them to JWT. |
 | `BUILDER_MODE=resource_inventory requires …dormant_user_resources.json` | Step 5 ran without Step R. Run `python run_all.py --from R`. |
 | PATCH fails with HTTP 403 | The token's user doesn't have permission to manage users. |
 | SSL errors | Certificate verification is off by default. If you've set `SSL_VERIFY=true`, make sure the instance's CA certificate is trusted. |
